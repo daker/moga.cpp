@@ -1,0 +1,696 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>moga shader viewer</title>
+<style>
+  :root { color-scheme: dark; --bg: #111214; --panel: #1b1d21; --text: #dde1e6; --muted: #8b929b; --ok: #5ec27a; --err: #ef6b6b; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p { margin: 0 0 12px; color: var(--muted); }
+  textarea { width: 100%; height: 180px; background: var(--panel); color: var(--text); border: 1px solid #2c3036; border-radius: 6px; padding: 8px; font: 12px/1.35 ui-monospace, Consolas, monospace; resize: vertical; }
+  .bar { display: flex; gap: 8px; align-items: center; margin: 8px 0 16px; flex-wrap: wrap; }
+  button { background: #2f6fd6; color: #fff; border: 0; border-radius: 6px; padding: 8px 14px; font: inherit; cursor: pointer; }
+  button.secondary { background: #2c3036; }
+  select { background: var(--panel); color: var(--text); border: 1px solid #2c3036; border-radius: 6px; padding: 6px; font: inherit; }
+  .views { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .view { background: var(--panel); border-radius: 8px; padding: 10px; min-width: 0; }
+  .view h2 { font-size: 14px; margin: 0 0 8px; }
+  canvas { width: 100%; aspect-ratio: 1; display: block; background: #000; border-radius: 4px; }
+  /* GLSL renders with clip space Y flipped (WebGPU memory order); flip once when presenting */
+  #gl { transform: scaleY(-1); }
+  pre { white-space: pre-wrap; word-break: break-word; font: 12px/1.35 ui-monospace, Consolas, monospace; margin: 8px 0 0; }
+  .ok { color: var(--ok); } .err { color: var(--err); }
+  details { margin-top: 16px; } summary { cursor: pointer; color: var(--muted); }
+</style>
+</head>
+<body>
+<h1>moga shader viewer</h1>
+<p>Paste the full output of an example (for example <code>example_pbr.exe</code>), then press Render. The page splits it into GLSL vertex, GLSL fragment and WGSL, fills uniforms, textures and tables from the reflected layout, and draws a lit sphere with each backend. A program without a view projection matrix gets a clip space triangle.</p>
+<textarea id="input" spellcheck="false" placeholder="// ---- GLSL vertex&#10;#version 300 es&#10;...&#10;// ---- GLSL fragment&#10;...&#10;// ---- WGSL&#10;..."></textarea>
+<div class="bar">
+  <button id="render">Render</button>
+  <label>Variant <select id="variant"></select></label>
+  <button class="secondary" id="clear">Clear</button>
+</div>
+<div class="views">
+  <div class="view"><h2>WebGL2 (GLSL)</h2><canvas id="gl" width="512" height="512"></canvas><pre id="glLog"></pre></div>
+  <div class="view"><h2>WebGPU (WGSL)</h2><canvas id="gpu" width="512" height="512"></canvas><pre id="gpuLog"></pre></div>
+</div>
+<details><summary>Uniform values used</summary><pre id="uniforms"></pre></details>
+<script>
+'use strict';
+
+// ---------------------------------------------------------------- parsing pasted output
+
+/** Splits example output into variants, each with optional GLSL vertex, GLSL fragment and WGSL. */
+function parseOutput(text) {
+  const variants = [];
+  let current = { name: 'program' };
+  let section = null;
+  const flush = () => { if (current.vertex || current.fragment || current.wgsl) variants.push(current); };
+  for (const line of text.split(/\r?\n/)) {
+    const v = /^\/\/ ==== (.*)/.exec(line);
+    if (v) { flush(); current = { name: v[1] }; section = null; continue; }
+    const s = /^\/\/ ---- (GLSL vertex|GLSL fragment|WGSL)/.exec(line);
+    if (s) { section = { 'GLSL vertex': 'vertex', 'GLSL fragment': 'fragment', WGSL: 'wgsl' }[s[1]]; current[section] = ''; continue; }
+    if (/^\/\/ .* generated in /.test(line) || /^reflection for /.test(line) || /^frame block:/.test(line)) { section = null; continue; }
+    if (section) current[section] += line + '\n';
+  }
+  flush();
+  // a bare shader without markers
+  if (variants.length === 0 && text.trim()) {
+    if (/@vertex|@fragment/.test(text)) variants.push({ name: 'program', wgsl: text });
+    else if (/gl_Position/.test(text)) variants.push({ name: 'program', vertex: text });
+    else variants.push({ name: 'program', fragment: text });
+  }
+  return variants;
+}
+
+/** Sizes of the WGSL types the viewer fills; uniform structs also carry explicit @size. */
+const WGSL_SIZES = {
+  f32: 4, i32: 4, u32: 4, f16: 2, vec2f: 8, vec3f: 12, vec4f: 16, vec2i: 8, vec4i: 16, vec2u: 8, vec4u: 16,
+  vec2h: 4, vec3h: 6, vec4h: 8, mat3x3f: 48, mat4x4f: 64,
+};
+
+/** Struct fields with byte offsets; WGSL uniform structs carry explicit @size. */
+function wgslStructs(code) {
+  const sizes = WGSL_SIZES;
+  const out = {};
+  for (const [, name, body] of code.matchAll(/struct (\w+) \{([\s\S]*?)\n\}/g)) {
+    let offset = 0;
+    const fields = [];
+    for (const m of body.matchAll(/(?:@align\((\d+)\) @size\((\d+)\) )?(\w+): ([\w<>, ]+),/g)) {
+      const type = m[4].trim();
+      const array = /array<(\w+), (\d+)>/.exec(type);
+      const size = m[2] ? +m[2] : (array ? sizes[array[1]] * +array[2] : sizes[type] ?? 16);
+      fields.push({ name: m[3], type, offset });
+      offset += size;
+    }
+    out[name] = { fields, size: Math.max(16, Math.ceil(offset / 16) * 16) };
+  }
+  // a field of struct type points at its struct, so values can be filled inside it
+  for (const st of Object.values(out)) for (const f of st.fields) if (out[f.type]) f.struct = out[f.type];
+  return out;
+}
+
+const STORAGE_ELEMENTS = 256;
+
+/** Alignments of the WGSL types the viewer sizes (vec3 aligns to 16, vec3h to 8). */
+const WGSL_ALIGNS = {
+  f32: 4, i32: 4, u32: 4, f16: 2, vec2f: 8, vec3f: 16, vec4f: 16, vec2i: 8, vec3i: 16, vec4i: 16,
+  vec2u: 8, vec3u: 16, vec4u: 16, vec2h: 4, vec3h: 8, vec4h: 8, mat3x3f: 16, mat4x4f: 16,
+};
+
+/**
+ * The array stride of a storage buffer element: its size rounded up to its
+ * alignment. Storage structs follow the plain WGSL rules (no 16 byte rounding).
+ */
+function wgslStorageStride(code, element) {
+  const bodies = {};
+  for (const [, name, body] of code.matchAll(/struct (\w+) \{([\s\S]*?)\n\}/g)) bodies[name] = body;
+  const layout = (type) => {
+    const array = /^array<(\w+), (\d+)>$/.exec(type);
+    if (array) {
+      const [size, align] = layout(array[1]);
+      return [Math.ceil(size / align) * align * +array[2], align];
+    }
+    if (WGSL_SIZES[type]) return [WGSL_SIZES[type], WGSL_ALIGNS[type]];
+    if (!bodies[type]) throw new Error(`storage element type ${type} is not known to the viewer`);
+    let offset = 0, align = 1;
+    for (const [, fieldType] of bodies[type].matchAll(/\w+: ([\w<>, ]+),/g)) {
+      const [size, a] = layout(fieldType.trim());
+      offset = Math.ceil(offset / a) * a + size;
+      align = Math.max(align, a);
+    }
+    return [Math.ceil(offset / align) * align, align];
+  };
+  const [size, align] = layout(element);
+  return Math.ceil(size / align) * align;
+}
+
+/** Uniform blocks, textures, tables and storage buffers declared in the WGSL, with their bindings. */
+function wgslResources(code) {
+  const structs = wgslStructs(code);
+  const res = [];
+  for (const m of code.matchAll(/@group\((\d+)\) @binding\((\d+)\) var(<[^>]+>)? (\w+): ([^;]+);/g)) {
+    const [, group, binding, space, name, type] = m;
+    const r = { group: +group, binding: +binding, name, type };
+    if (space === '<uniform>') { r.kind = 'uniform'; r.struct = structs[type]; r.block = name.slice(3); }
+    else if (space?.startsWith('<storage') && name.startsWith('tb_')) { r.kind = 'table'; r.struct = structs[/array<(\w+)>/.exec(type)[1]]; r.table = name.slice(3); }
+    else if (space?.startsWith('<storage')) {
+      // a storage buffer: the viewer gives it zeros, room for STORAGE_ELEMENTS elements
+      const element = /array<(\w+)>/.exec(type)?.[1] ?? type;
+      r.kind = 'storage';
+      r.size = wgslStorageStride(code, element) * STORAGE_ELEMENTS;
+    }
+    else if (type === 'sampler') r.kind = 'sampler';
+    else r.kind = 'texture';
+    res.push(r);
+  }
+  return res;
+}
+
+/** Attribute names, locations and types from VSIn. */
+function wgslAttributes(code) {
+  const vsIn = /struct VSIn \{([\s\S]*?)\n\}/.exec(code);
+  if (!vsIn) return [];
+  return [...vsIn[1].matchAll(/@location\((\d+)\) a_(\w+): (\w+),/g)].map(([, loc, name, type]) => ({ loc: +loc, name, type }));
+}
+
+/**
+ * std140 layout of a GLSL field list. A struct (declared in the same code)
+ * has its own size, aligned to 16; an array element takes a multiple of 16
+ * bytes; a member after a struct or an array starts on a 16 byte boundary.
+ * This is the rule the moga uniform layout follows.
+ */
+function std140Layout(code) {
+  const base = {
+    float: [4, 4], int: [4, 4], uint: [4, 4], vec2: [8, 8], ivec2: [8, 8], uvec2: [8, 8],
+    vec3: [12, 16], ivec3: [12, 16], uvec3: [12, 16], vec4: [16, 16], ivec4: [16, 16], uvec4: [16, 16],
+    mat3: [48, 16], mat4: [64, 16],
+  };
+  const bodies = {};
+  for (const [, name, body] of code.matchAll(/struct (\w+) \{([\s\S]*?)\n\};/g)) bodies[name] = body;
+  const structs = {};
+  const typeLayout = (type) => {
+    if (base[type]) return base[type];
+    if (!bodies[type]) throw new Error(`uniform field type ${type} is not known to the viewer`);
+    structs[type] ??= fieldsOf(bodies[type]);
+    return [structs[type].size, 16];
+  };
+  const fieldsOf = (body) => {
+    let offset = 0;
+    const fields = [];
+    for (const [, type, name, len] of body.matchAll(/(\w+) (\w+)(?:\[(\d+)\])?;/g)) {
+      let [size, align] = typeLayout(type);
+      if (len) [size, align] = [Math.ceil(size / 16) * 16 * +len, 16];
+      offset = Math.ceil(offset / align) * align;
+      fields.push({ name, type: len ? `array<${type}>` : type, offset, struct: len ? undefined : structs[type] });
+      offset += size;
+      if (len || bodies[type]) offset = Math.ceil(offset / 16) * 16;
+    }
+    return { fields, size: Math.max(16, Math.ceil(offset / 16) * 16) };
+  };
+  return fieldsOf;
+}
+
+/** GLSL only output: uniform block fields follow std140, which matches the WGSL layout rules. */
+function glslBlocks(code) {
+  const layout = std140Layout(code);
+  const out = [];
+  for (const [, block, body, inst] of code.matchAll(/uniform (UB_\w+) \{([\s\S]*?)\n\} (ub_\w+);/g))
+    out.push({ glslName: block, block: inst.slice(3), struct: layout(body) });
+  return out;
+}
+
+// ---------------------------------------------------------------- scene
+
+function perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2);
+  // WebGPU clip conventions (depth 0..w); the GLSL backend remaps
+  return [f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, far / (near - far), -1, 0, 0, (near * far) / (near - far), 0];
+}
+function lookAt(eye, target) {
+  const sub = (a, b) => a.map((x, i) => x - b[i]);
+  const norm = (a) => { const l = Math.hypot(...a); return a.map((x) => x / l); };
+  const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const z = norm(sub(eye, target)), x = norm(cross([0, 1, 0], z)), y = cross(z, x);
+  return [x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0, -dot(x, eye), -dot(y, eye), -dot(z, eye), 1];
+}
+function mul(a, b) {
+  const o = new Array(16).fill(0);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) for (let k = 0; k < 4; k++) o[c * 4 + r] += a[k * 4 + r] * b[c * 4 + k];
+  return o;
+}
+const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+
+/** UV sphere, non indexed, with per vertex position, normal, uv and color. */
+function sphere(seg = 48) {
+  const attr = { position: [], normal: [], uv: [], color: [] };
+  const vert = (i, j) => {
+    const th = (i / seg) * Math.PI, ph = (j / seg) * 2 * Math.PI;
+    const n = [Math.sin(th) * Math.cos(ph), Math.cos(th), Math.sin(th) * Math.sin(ph)];
+    attr.position.push(...n); attr.normal.push(...n); attr.uv.push(j / seg, i / seg);
+    attr.color.push(n[0] * 0.5 + 0.5, n[1] * 0.5 + 0.5, n[2] * 0.5 + 0.5, 1);
+  };
+  for (let i = 0; i < seg; i++)
+    for (let j = 0; j < seg; j++)
+      // counter clockwise seen from outside, so frontFacing is true on the visible side
+      for (const [a, b] of [[i, j], [i + 1, j + 1], [i + 1, j], [i, j], [i, j + 1], [i + 1, j + 1]]) vert(a, b);
+  return { attr, count: (seg * seg * 6) };
+}
+/** One triangle in clip space with red, green and blue corners. */
+function triangle() {
+  const attr = {
+    position: [0, 0.8, 0.5, -0.8, -0.7, 0.5, 0.8, -0.7, 0.5],
+    normal: [0, 0, 1, 0, 0, 1, 0, 0, 1],
+    uv: [0.5, 0, 0, 1, 1, 1],
+    color: [1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1],
+  };
+  return { attr, count: 3 };
+}
+const SPHERE = sphere();
+const TRIANGLE = triangle();
+/** Mesh of the current program: a sphere when it has a camera, else a clip space triangle. */
+let MESH = SPHERE;
+
+/** Float data for an attribute by name; unknown names get zeros. */
+function attributeData(name, components) {
+  const src = MESH.attr[name];
+  const out = new Float32Array(MESH.count * components);
+  if (!src) return out;
+  const have = src.length / MESH.count;
+  for (let v = 0; v < MESH.count; v++)
+    for (let c = 0; c < components; c++) out[v * components + c] = c < have ? src[v * have + c] : (c === 3 ? 1 : 0);
+  return out;
+}
+
+/** The typed view that a field's values go through: integers are written as integers, not as float bits. */
+function fieldView(buf, type) {
+  if (/^(u32|uint|uvec\d|vec\du)$/.test(type)) return new Uint32Array(buf);
+  if (/^(i32|int|ivec\d|vec\di)$/.test(type)) return new Int32Array(buf);
+  return new Float32Array(buf);
+}
+
+/** IEEE binary16 bits of x, rounded to nearest even (through the f32 value). */
+function halfBits(x) {
+  const u = new Uint32Array(new Float32Array([x]).buffer)[0];
+  const sign = (u >>> 16) & 0x8000, exp = (u >>> 23) & 0xff;
+  let mant = u & 0x7fffff;
+  if (exp === 0xff) return sign | 0x7c00 | (mant ? 0x200 : 0);
+  const e = exp - 127 + 15;
+  if (e >= 31) return sign | 0x7c00;
+  let shift = 13, h;
+  if (e <= 0) {
+    if (e < -10) return sign;
+    mant |= 0x800000;
+    shift = 14 - e;
+    h = mant >>> shift;
+  } else {
+    h = (e << 10) | (mant >>> 13);
+  }
+  const rest = mant & ((1 << shift) - 1), half = 1 << (shift - 1);
+  if (rest > half || (rest === half && (h & 1))) h++;
+  return sign | h;
+}
+
+/** Writes values at a byte offset as the field type stores them: f16 as binary16, integers as integers. */
+function writeField(buf, offset, type, values) {
+  // a vec3 followed by a scalar shares its 16 bytes: a fourth value would land in the scalar
+  const count = /^(mat3|mat3x3f)$/.test(type) ? 12 : /^(mat4|mat4x4f)$/.test(type) ? 16 : +(/vec(\d)/.exec(type)?.[1] ?? 1);
+  values = values.slice(0, count);
+  if (/^(f16|vec\dh)$/.test(type)) {
+    const dv = new DataView(buf);
+    values.forEach((x, k) => dv.setUint16(offset + 2 * k, halfBits(x), true));
+    return values.map((x) => +x.toFixed(3));
+  }
+  const view = fieldView(buf, type);
+  const integer = !(view instanceof Float32Array);
+  view.set(integer ? values.map((x) => Math.round(x)) : values, offset / 4);
+  return [...view.subarray(offset / 4, offset / 4 + values.length)].map((x) => +x.toFixed(3));
+}
+
+/** Fills a uniform struct by field name, nested structs too; unknown fields stay zero (or identity for matrices). */
+function fillUniforms(block, struct, frame) {
+  const buf = new ArrayBuffer(struct.size);
+  const used = {};
+  fillFields(block, struct, 0, '', buf, used, frame);
+  return { data: buf, used };
+}
+
+function fillFields(block, struct, base, prefix, buf, used, frame) {
+  for (const field of struct.fields) {
+    if (field.struct) {
+      fillFields(block, field.struct, base + field.offset, `${prefix}${field.name}.`, buf, used, frame);
+      continue;
+    }
+    const n = field.name.toLowerCase(), t = field.type;
+    let v;
+    if (/^(mat4|mat4x4f)$/.test(t)) v = /proj|mvp/.test(n) ? frame.viewProj : IDENTITY;
+    else if (/mat3/.test(t)) v = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0];
+    else if (n === 'eye') v = [...frame.eye, 1];
+    else if (n.includes('direction')) v = [-0.4, -0.6, -1, 0];
+    else if (n === 'color' && block.includes('light')) v = [3, 3, 3, 0];
+    else if (/basecolor|diffuse|tint|color/.test(n)) v = [0.9, 0.2, 0.15, 1];
+    else if (n === 'specular') v = [1, 1, 1, 1];
+    else if (n === 'shininess') v = [32];
+    else if (n === 'metallicroughness') v = [0, 0.35, 0, 0];
+    else if (n === 'time') v = [frame.time];
+    else if (n === 'waves') v = [3];
+    if (v) {
+      const written = writeField(buf, base + field.offset, t, v);
+      used[prefix + field.name] = written.length === 1 ? written[0] : written;
+    }
+  }
+}
+
+/** Table record: matrices identity, vectors tinted. */
+function fillTable(struct) {
+  const f = new Float32Array(Math.max(4, struct.fields.reduce((n, x) => n + (/mat4/.test(x.type) ? 16 : 4), 0)));
+  let o = 0;
+  for (const field of struct.fields) {
+    if (/mat4/.test(field.type)) { f.set(IDENTITY, o); o += 16; } else { f.set([0.2, 0.6, 0.9, 1], o); o += 4; }
+  }
+  return f;
+}
+
+function checkerPixels(size = 64) {
+  const px = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y++)
+    for (let x = 0; x < size; x++) {
+      const on = ((x >> 3) + (y >> 3)) & 1, o = (y * size + x) * 4;
+      px.set(on ? [240, 240, 240, 255] : [60, 140, 220, 255], o);
+    }
+  return { size, px };
+}
+
+function frameState(t) {
+  const eye = [Math.sin(t * 0.4) * 3.2, 1.2, Math.cos(t * 0.4) * 3.2];
+  return { eye, time: t, viewProj: mul(perspective(Math.PI / 4, 1, 0.1, 50), lookAt(eye, [0, 0, 0])) };
+}
+
+// ---------------------------------------------------------------- WebGL2
+
+function setupGL(v, wgslInfo) {
+  const canvas = document.getElementById('gl');
+  const gl = canvas.getContext('webgl2');
+  if (!gl) throw new Error('WebGL2 is not available');
+  if (!v.vertex || !v.fragment) throw new Error('needs both the GLSL vertex and fragment stages');
+  // each #extension of the GLSL needs its WebGL extension enabled before compiling
+  const glExtensions = {
+    GL_ANGLE_clip_cull_distance: 'WEBGL_clip_cull_distance', GL_EXT_clip_cull_distance: 'WEBGL_clip_cull_distance',
+    GL_ANGLE_multi_draw: 'WEBGL_multi_draw', GL_EXT_blend_func_extended: 'WEBGL_blend_func_extended',
+  };
+  for (const [, name] of (v.vertex + v.fragment).matchAll(/#extension (\w+)/g)) {
+    if (!glExtensions[name]) throw new Error(`#extension ${name}: the viewer does not know its WebGL extension`);
+    if (!gl.getExtension(glExtensions[name])) throw new Error(`${glExtensions[name]} is not supported here`);
+  }
+  const compile = (type, src, label) => {
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(`${label}: ${gl.getShaderInfoLog(s)}`);
+    return s;
+  };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, v.vertex, 'vertex'));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, v.fragment, 'fragment'));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error('link: ' + gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  for (const [, type, name] of v.vertex.matchAll(/in (\w+) a_(\w+);/g)) {
+    const loc = gl.getAttribLocation(prog, 'a_' + name);
+    if (loc < 0) continue;
+    const n = { float: 1, vec2: 2, vec3: 3, vec4: 4 }[type] ?? 4;
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, attributeData(name, n), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, n, gl.FLOAT, false, 0, 0);
+  }
+
+  const blocks = [];
+  const seen = new Set();
+  for (const b of [...glslBlocks(v.vertex), ...glslBlocks(v.fragment)]) {
+    if (seen.has(b.glslName)) continue;
+    seen.add(b.glslName);
+    const index = gl.getUniformBlockIndex(prog, b.glslName);
+    if (index === gl.INVALID_INDEX) continue;
+    const point = blocks.length;
+    gl.uniformBlockBinding(prog, index, point);
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.UNIFORM_BUFFER, buffer);
+    gl.bufferData(gl.UNIFORM_BUFFER, b.struct.size, gl.DYNAMIC_DRAW);
+    gl.bindBufferBase(gl.UNIFORM_BUFFER, point, buffer);
+    blocks.push({ ...b, buffer });
+  }
+
+  let unit = 0;
+  const all = v.vertex + v.fragment;
+  // both stages declare a texture they share; it takes one unit
+  const bound = new Set();
+  for (const [, type, name] of all.matchAll(/uniform highp (\w+) (t_\w+);/g)) {
+    if (bound.has(name)) continue;
+    bound.add(name);
+    if (type !== 'sampler2D') throw new Error(`${name}: only 2D float textures are filled by the viewer`);
+    const { size, px } = checkerPixels();
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, size, size, 0, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.uniform1i(gl.getUniformLocation(prog, name), unit++);
+  }
+  for (const [, name] of all.matchAll(/uniform highp sampler2D (tb_\w+);/g)) {
+    if (bound.has(name)) continue;
+    bound.add(name);
+    const table = wgslInfo?.resources.find((r) => r.kind === 'table' && 'tb_' + r.table === name);
+    const data = table ? fillTable(table.struct) : new Float32Array(IDENTITY.concat([1, 1, 1, 1]));
+    const texels = data.length / 4;
+    const tex = new Float32Array(2048 * 4);
+    tex.set(data);
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 2048, 1, 0, gl.RGBA, gl.FLOAT, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.uniform1i(gl.getUniformLocation(prog, name), unit++);
+    if (texels === 0) throw new Error(`${name}: empty table`);
+  }
+  for (const u of ['moga_BaseInstance', 'moga_DrawBase']) {
+    const loc = gl.getUniformLocation(prog, u);
+    if (loc) gl.uniform1i(loc, 0);
+  }
+  // the GLSL backend emits flat varyings only for the first vertex convention (or for either vertex)
+  let note = '';
+  if (/\bflat out\b/.test(v.vertex)) {
+    const provoking = gl.getExtension('WEBGL_provoking_vertex');
+    if (provoking) provoking.provokingVertexWEBGL(provoking.FIRST_VERTEX_CONVENTION_WEBGL);
+    else note = '; WEBGL_provoking_vertex is missing, flat varyings take the last vertex';
+  }
+  gl.enable(gl.DEPTH_TEST);
+  // flipped Y reverses the winding seen by GL
+  gl.frontFace(gl.CW);
+
+  const draw = (frame) => {
+    const used = {};
+    for (const b of blocks) {
+      const { data, used: u } = fillUniforms(b.block, b.struct, frame);
+      used[b.block] = u;
+      gl.bindBuffer(gl.UNIFORM_BUFFER, b.buffer);
+      gl.bufferSubData(gl.UNIFORM_BUFFER, 0, new Uint8Array(data));
+    }
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clearColor(0.05, 0.05, 0.06, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLES, 0, MESH.count);
+    const err = gl.getError();
+    if (err) throw new Error('GL error 0x' + err.toString(16));
+    return used;
+  };
+  draw.note = note;
+  return draw;
+}
+
+// ---------------------------------------------------------------- WebGPU
+
+async function setupGPU(v) {
+  if (!v.wgsl) throw new Error('no WGSL in the pasted output');
+  if (!navigator.gpu) throw new Error('WebGPU is not available');
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error('no WebGPU adapter');
+  // each WGSL extension needs its device feature; requires names language features
+  const extensionFeatures = {
+    clip_distances: 'clip-distances', f16: 'shader-f16', subgroups: 'subgroups', primitive_index: 'primitive-index',
+    dual_source_blending: 'dual-source-blending', subgroup_size_control: 'subgroup-size-control',
+  };
+  const requiredFeatures = [];
+  for (const [, list] of v.wgsl.matchAll(/^enable ([\w, ]+);/gm))
+    for (const name of list.split(',').map((x) => x.trim())) {
+      const feature = extensionFeatures[name];
+      if (!feature) throw new Error(`enable ${name}: the viewer does not know its device feature`);
+      if (!adapter.features.has(feature)) throw new Error(`${feature} is not supported by this adapter`);
+      requiredFeatures.push(feature);
+    }
+  for (const [, list] of v.wgsl.matchAll(/^requires ([\w, ]+);/gm))
+    for (const name of list.split(',').map((x) => x.trim()))
+      if (!navigator.gpu.wgslLanguageFeatures.has(name)) throw new Error(`requires ${name}: not supported here`);
+  if (adapter.features.has('rg11b10ufloat-renderable') && !requiredFeatures.includes('rg11b10ufloat-renderable'))
+    requiredFeatures.push('rg11b10ufloat-renderable');
+  const device = await adapter.requestDevice({ requiredFeatures });
+  const canvas = document.getElementById('gpu');
+  const ctx = canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format, alphaMode: 'opaque' });
+
+  const module = device.createShaderModule({ code: v.wgsl });
+  const info = await module.getCompilationInfo();
+  const errors = info.messages.filter((m) => m.type === 'error');
+  if (errors.length) throw new Error(errors.map((m) => `line ${m.lineNum}:${m.linePos} ${m.message}`).join('\n'));
+
+  const formats = { f32: 'float32', vec2f: 'float32x2', vec3f: 'float32x3', vec4f: 'float32x4' };
+  const attrs = wgslAttributes(v.wgsl);
+  const buffers = attrs.map((a) => {
+    if (!formats[a.type]) throw new Error(`attribute ${a.name}: ${a.type} is not filled by the viewer`);
+    return { arrayStride: { f32: 4, vec2f: 8, vec3f: 12, vec4f: 16 }[a.type], attributes: [{ shaderLocation: a.loc, offset: 0, format: formats[a.type] }] };
+  });
+  const vbos = attrs.map((a) => {
+    const data = attributeData(a.name, { f32: 1, vec2f: 2, vec3f: 3, vec4f: 4 }[a.type]);
+    const b = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(b, 0, data);
+    return b;
+  });
+  // one target per output location (null where none): a format may not have more
+  // components than the output, and location 0 shows on the canvas when it is a float vec4
+  const outputs = [...(/struct FSOut \{([\s\S]*?)\n\}/.exec(v.wgsl)?.[1] ?? '')
+    .matchAll(/@location\((\d+)\)(?: @blend_src\((\d)\))? \w+: (\w+),/g)]
+    .filter(([, , src]) => src !== '1')
+    .map(([, loc, , type]) => ({ loc: +loc, type }));
+  const canRg11b10 = device.features.has('rg11b10ufloat-renderable');
+  const targetFormat = (o) => {
+    const n = /^vec(\d)/.exec(o.type)?.[1] ?? '1';
+    const kind = /u$|^u32$/.test(o.type) ? 'uint' : /i$|^i32$/.test(o.type) ? 'sint' : 'float';
+    if (o.loc === 0 && n === '4' && kind === 'float') return format;
+    if (kind === 'float' && n === '3') return canRg11b10 ? 'rg11b10ufloat' : 'rg32float';
+    const channels = { 1: 'r', 2: 'rg', 3: 'rg', 4: 'rgba' }[n];
+    return `${channels}${kind === 'float' && n === '4' ? '16' : '32'}${kind}`;
+  };
+  const targets = [];
+  for (const o of outputs) targets[o.loc] = { format: targetFormat(o) };
+  for (let i = 0; i < targets.length; i++) targets[i] ??= null;
+  const offscreen = outputs.filter((o) => targets[o.loc].format !== format).map((o) =>
+    ({ loc: o.loc, view: device.createTexture({ size: [canvas.width, canvas.height], format: targets[o.loc].format, usage: GPUTextureUsage.RENDER_ATTACHMENT }).createView() }));
+  device.pushErrorScope('validation');
+  const pipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module, entryPoint: 'vs_main', buffers },
+    fragment: { module, entryPoint: 'fs_main', targets },
+    primitive: { topology: 'triangle-list' },
+    depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+  });
+  const pipeErr = await device.popErrorScope();
+  if (pipeErr) throw new Error('pipeline: ' + pipeErr.message);
+
+  const resources = wgslResources(v.wgsl);
+  const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+  const uniformBuffers = [];
+  const entriesByGroup = new Map();
+  // a retained resource that no entry point reads is not in the automatic layout
+  const reads = (name) => (v.wgsl.match(new RegExp(`\\b${name}\\b`, 'g')) ?? []).length > 1;
+  for (const r of resources) {
+    if (!reads(r.name)) continue;
+    let resource;
+    if (r.kind === 'uniform') {
+      const buffer = device.createBuffer({ size: r.struct.size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      uniformBuffers.push({ ...r, buffer });
+      resource = { buffer };
+    } else if (r.kind === 'table') {
+      const data = fillTable(r.struct);
+      const buffer = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(buffer, 0, data);
+      resource = { buffer };
+    } else if (r.kind === 'storage') {
+      resource = { buffer: device.createBuffer({ size: r.size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }) };
+    } else if (r.kind === 'sampler') {
+      resource = sampler;
+    } else {
+      if (r.type !== 'texture_2d<f32>') throw new Error(`${r.name}: only texture_2d<f32> is filled by the viewer`);
+      const { size, px } = checkerPixels();
+      const tex = device.createTexture({ size: [size, size], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      device.queue.writeTexture({ texture: tex }, px, { bytesPerRow: size * 4 }, [size, size]);
+      resource = tex.createView();
+    }
+    if (!entriesByGroup.has(r.group)) entriesByGroup.set(r.group, []);
+    entriesByGroup.get(r.group).push({ binding: r.binding, resource });
+  }
+  const maxGroup = Math.max(-1, ...entriesByGroup.keys());
+  const groups = [];
+  for (let g = 0; g <= maxGroup; g++)
+    groups.push(device.createBindGroup({ layout: pipeline.getBindGroupLayout(g), entries: entriesByGroup.get(g) ?? [] }));
+  const depth = device.createTexture({ size: [canvas.width, canvas.height], format: 'depth24plus', usage: GPUTextureUsage.RENDER_ATTACHMENT });
+
+  const draw = async (frame) => {
+    const used = {};
+    for (const u of uniformBuffers) {
+      const { data, used: values } = fillUniforms(u.block, u.struct, frame);
+      used[u.block] = values;
+      device.queue.writeBuffer(u.buffer, 0, data);
+    }
+    device.pushErrorScope('validation');
+    const enc = device.createCommandEncoder();
+    const colorAttachments = targets.map((t, loc) => {
+      if (!t) return null;
+      const view = t.format === format ? ctx.getCurrentTexture().createView() : offscreen.find((o) => o.loc === loc).view;
+      return { view, loadOp: 'clear', storeOp: 'store', clearValue: [0.05, 0.05, 0.06, 1] };
+    });
+    const pass = enc.beginRenderPass({
+      colorAttachments,
+      depthStencilAttachment: { view: depth.createView(), depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1 },
+    });
+    pass.setPipeline(pipeline);
+    vbos.forEach((b, i) => pass.setVertexBuffer(i, b));
+    groups.forEach((g, i) => pass.setBindGroup(i, g));
+    pass.draw(MESH.count);
+    pass.end();
+    device.queue.submit([enc.finish()]);
+    const err = await device.popErrorScope();
+    if (err) throw new Error(err.message);
+    return used;
+  };
+  const hidden = offscreen.map((o) => o.loc);
+  draw.note = hidden.length ? `; outputs at location ${hidden.join(', ')} go to offscreen targets` : '';
+  return draw;
+}
+
+// ---------------------------------------------------------------- UI
+
+const input = document.getElementById('input');
+const variantSelect = document.getElementById('variant');
+let variants = [];
+let running = 0;
+
+function status(id, ok, text) {
+  const el = document.getElementById(id);
+  el.className = ok ? 'ok' : 'err';
+  el.textContent = text;
+}
+
+function refreshVariants() {
+  variants = parseOutput(input.value);
+  variantSelect.innerHTML = '';
+  variants.forEach((v, i) => variantSelect.add(new Option(v.name, i)));
+}
+
+async function render() {
+  const token = ++running;
+  const index = +variantSelect.value || 0;
+  refreshVariants();
+  if (index < variants.length) variantSelect.value = index;
+  const v = variants[index] ?? variants[0];
+  if (!v) { status('glLog', false, 'nothing to render: paste an example output'); status('gpuLog', false, ''); return; }
+  const wgslInfo = v.wgsl ? { resources: wgslResources(v.wgsl) } : null;
+  const text = (v.vertex ?? '') + (v.wgsl ?? '');
+  MESH = /proj|mvp/i.test(text) ? SPHERE : TRIANGLE;
+  let drawGL = null, drawGPU = null;
+  try { drawGL = setupGL(v, wgslInfo); status('glLog', true, 'compiled and linked' + drawGL.note); } catch (e) { status('glLog', false, e.message); }
+  try { drawGPU = await setupGPU(v); status('gpuLog', true, 'compiled, pipeline created' + drawGPU.note); } catch (e) { status('gpuLog', false, e.message); }
+  const start = performance.now();
+  const loop = async () => {
+    if (token !== running) return;
+    const frame = frameState((performance.now() - start) / 1000);
+    const used = {};
+    if (drawGL) try { Object.assign(used, drawGL(frame)); } catch (e) { status('glLog', false, e.message); drawGL = null; }
+    if (drawGPU) try { Object.assign(used, await drawGPU(frame)); } catch (e) { status('gpuLog', false, e.message); drawGPU = null; }
+    document.getElementById('uniforms').textContent = JSON.stringify(used, null, 1);
+    if (drawGL || drawGPU) requestAnimationFrame(loop);
+  };
+  loop();
+}
+
+document.getElementById('render').onclick = render;
+variantSelect.onchange = render;
+document.getElementById('clear').onclick = () => { input.value = ''; running++; refreshVariants(); };
+input.addEventListener('input', () => { refreshVariants(); variantSelect.value = 0; });
+</script>
+</body>
+</html>
